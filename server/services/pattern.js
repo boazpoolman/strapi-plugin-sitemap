@@ -1,7 +1,5 @@
 'use strict';
 
-const { logMessage } = require('../utils');
-
 /**
  * Pattern service.
  */
@@ -22,19 +20,16 @@ const getAllowedFields = (contentType, allowedFields = []) => {
       if ((field.type === fieldType || fieldName === fieldType) && field.type !== 'relation') {
         fields.push(fieldName);
       } else if (
-        field.type === 'relation'
-        && field.target
-        && field.relation.endsWith('ToOne') // TODO: implement `ToMany` relations (#78).
-        && fieldName !== 'localizations'
-        && fieldName !== 'createdBy'
-        && fieldName !== 'updatedBy'
+        field.type === 'relation' &&
+        field.target &&
+        field.relation.endsWith('ToOne') &&
+        fieldName !== 'localizations' &&
+        fieldName !== 'createdBy' &&
+        fieldName !== 'updatedBy'
       ) {
         const relation = strapi.contentTypes[field.target];
 
-        if (
-          fieldTypes.includes('id')
-          && !fields.includes(`${fieldName}.id`)
-        ) {
+        if (fieldTypes.includes('id') && !fields.includes(`${fieldName}.id`)) {
           fields.push(`${fieldName}.id`);
         }
 
@@ -44,9 +39,25 @@ const getAllowedFields = (contentType, allowedFields = []) => {
           }
         });
       } else if (
-        field.type === 'component'
-        && field.component
-        && field.repeatable !== true // TODO: implement repeatable components (#78).
+        field.type === 'relation' &&
+        field.target &&
+        field.mappedBy &&
+        field.relation.endsWith('ToMany') &&
+        fieldName !== 'localizations' &&
+        fieldName !== 'createdBy' &&
+        fieldName !== 'updatedBy'
+      ) {
+        const relation = strapi.contentTypes[field.target];
+
+        Object.entries(relation.attributes).map(([subFieldName, subField]) => {
+          if (subField.type === fieldType || subFieldName === fieldType) {
+            fields.push(`${fieldName}[0].${subFieldName}`);
+          }
+        });
+      } else if (
+        field.type === 'component' &&
+        field.component &&
+        field.repeatable !== true // TODO: implement repeatable components (#78).
       ) {
         const relation = strapi.components[field.component];
 
@@ -74,7 +85,6 @@ const getAllowedFields = (contentType, allowedFields = []) => {
   return fields;
 };
 
-
 /**
  * Get all fields from a pattern.
  *
@@ -85,12 +95,17 @@ const getAllowedFields = (contentType, allowedFields = []) => {
  * @returns {array} The fields.
  */
 const getFieldsFromPattern = (pattern, topLevel = false, relation = null) => {
-  let fields = pattern.match(/[[\w\d.]+]/g); // Get all substrings between [] as array.
+  let fields = pattern.match(/(?<=\/)(\[.*?\])(?=\/|$)/g); // Get all substrings between [] as array.
+
   // eslint-disable-next-line prefer-regex-literals
-  fields = fields.map((field) => RegExp(/(?<=\[)(.*?)(?=\])/).exec(field)[0]); // Strip [] from string.
+  fields = fields.map((field) => field.replace(/^.|.$/g, '')); // Strip [] from string.
 
   if (relation) {
-    fields = fields.filter((field) => field.startsWith(`${relation}.`));
+    fields = fields.filter(
+      (field) =>
+        // eslint-disable-next-line implicit-arrow-linebreak
+        field.startsWith(`${relation}.`) || field.startsWith(`${relation}[`),
+    );
     fields = fields.map((field) => field.split('.')[1]);
   } else if (topLevel) {
     fields = fields.filter((field) => field.split('.').length === 1);
@@ -108,8 +123,12 @@ const getFieldsFromPattern = (pattern, topLevel = false, relation = null) => {
  */
 const getRelationsFromPattern = (pattern) => {
   let fields = getFieldsFromPattern(pattern);
+
   fields = fields.filter((field) => field.split('.').length > 1); // Filter on fields containing a dot (.)
-  fields = fields.map((field) => field.split('.')[0]); // Extract the first part of the fields
+  fields = fields
+    .map((field) => field.split('.')[0]) // Extract the first part of the fields. Ex: categories[0].slug -> categories[0]
+    .map((field) => field.split('[')[0]); // Extract the first part of the fields. Ex: categories[0] -> categories
+
   return fields;
 };
 
@@ -126,14 +145,39 @@ const resolvePattern = async (pattern, entity) => {
   const fields = getFieldsFromPattern(pattern);
 
   fields.map((field) => {
-    const relationalField = field.split('.').length > 1 ? field.split('.') : null;
+    let relationalField = field.split('.').length > 1 ? field.split('.') : null;
+
+    if (field && field.includes('[')) {
+      // If the relational field many to many. Ex: categories[0].slug
+      const childField = field.split('[')[0];
+
+      // Extract array index
+      const indexExecArray = /\[(\d+)\]/g.exec(field);
+      const childIndexField = parseInt(indexExecArray[1], 10);
+
+      relationalField = [childField, relationalField[1], childIndexField]; // ['categories', 'slug', 0]
+    }
 
     if (!relationalField) {
       pattern = pattern.replace(`[${field}]`, entity[field] || '');
     } else if (Array.isArray(entity[relationalField[0]])) {
-      strapi.log.error(logMessage('Something went wrong whilst resolving the pattern.'));
+      // Many to Many relationship
+      pattern = pattern.replace(
+        `[${field}]`,
+        entity[relationalField[0]] &&
+          entity[relationalField[0]][relationalField[2]] &&
+          entity[relationalField[0]][relationalField[2]][relationalField[1]]
+          ? entity[relationalField[0]][relationalField[2]][relationalField[1]]
+          : '',
+      );
     } else if (typeof entity[relationalField[0]] === 'object') {
-      pattern = pattern.replace(`[${field}]`, entity[relationalField[0]] && entity[relationalField[0]][relationalField[1]] ? entity[relationalField[0]][relationalField[1]] : '');
+      pattern = pattern.replace(
+        `[${field}]`,
+        entity[relationalField[0]] &&
+          entity[relationalField[0]][relationalField[1]]
+          ? entity[relationalField[0]][relationalField[1]]
+          : '',
+      );
     }
   });
 
@@ -180,7 +224,16 @@ const validatePattern = async (pattern, allowedFieldNames) => {
   let fieldsAreAllowed = true;
 
   getFieldsFromPattern(pattern).map((field) => {
-    if (!allowedFieldNames.includes(field)) fieldsAreAllowed = false;
+    if (field.includes('[')) {
+      // Validate value with array. Ex: categories[10].slug
+      const fieldReplaced = field.replace(/\[(\d+)\]/, '[0]');
+
+      if (!allowedFieldNames.includes(fieldReplaced)) {
+        fieldsAreAllowed = false;
+      }
+    } else if (!allowedFieldNames.includes(field)) {
+      fieldsAreAllowed = false;
+    }
   });
 
   if (!fieldsAreAllowed) {
